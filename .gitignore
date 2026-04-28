@@ -1,0 +1,6 @@
+node_modules/
+*.log
+ci-doctor.md
+ci-doctor.json
+ci-doctor.sarif
+.npmrc-publish

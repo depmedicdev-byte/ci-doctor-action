@@ -1,0 +1,145 @@
+name: 'ci-doctor'
+description: 'Audit GitHub Actions workflows for waste, cost, and security gaps. 16 rules, SARIF + PR comment.'
+author: 'depmedic'
+
+branding:
+  icon: 'activity'
+  color: 'green'
+
+inputs:
+  path:
+    description: 'Path to scan. Default = repo root, which auto-discovers .github/workflows.'
+    required: false
+    default: '.'
+  fail-on:
+    description: 'Severity threshold for non-zero exit: info | warn | error. Default = error (only hard-fails on error-level findings).'
+    required: false
+    default: 'error'
+  upload-sarif:
+    description: 'Upload SARIF to GitHub Code Scanning so findings show under the Security tab. Requires security-events: write permission.'
+    required: false
+    default: 'true'
+  comment-on-pr:
+    description: 'Post a markdown table of findings as a PR comment. Requires pull-requests: write permission.'
+    required: false
+    default: 'true'
+  ci-doctor-version:
+    description: 'npm version of ci-doctor to run. Pin to a SHA-tag for reproducibility.'
+    required: false
+    default: 'latest'
+  only:
+    description: 'Comma-separated list of rule IDs to run exclusively.'
+    required: false
+    default: ''
+  disable:
+    description: 'Comma-separated list of rule IDs to skip.'
+    required: false
+    default: ''
+
+outputs:
+  sarif-path:
+    description: 'Path to the SARIF file produced by ci-doctor.'
+    value: ${{ steps.sarif.outputs.sarif-path }}
+  markdown-path:
+    description: 'Path to the markdown report produced by ci-doctor.'
+    value: ${{ steps.markdown.outputs.markdown-path }}
+  finding-count:
+    description: 'Total number of findings (parsed from JSON report).'
+    value: ${{ steps.json.outputs.finding-count }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Resolve flags
+      id: flags
+      shell: bash
+      run: |
+        FLAGS=""
+        if [ -n "${{ inputs.only }}" ]; then FLAGS="$FLAGS --only=${{ inputs.only }}"; fi
+        if [ -n "${{ inputs.disable }}" ]; then FLAGS="$FLAGS --disable=${{ inputs.disable }}"; fi
+        echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
+        echo "ci-doctor flags: $FLAGS"
+
+    - name: Run ci-doctor (markdown report)
+      id: markdown
+      shell: bash
+      run: |
+        set +e
+        npx --yes ci-doctor@${{ inputs.ci-doctor-version }} ${{ steps.flags.outputs.flags }} --markdown "${{ inputs.path }}" > ci-doctor.md
+        echo "markdown-path=ci-doctor.md" >> "$GITHUB_OUTPUT"
+        echo "::group::ci-doctor markdown"
+        cat ci-doctor.md || true
+        echo "::endgroup::"
+
+    - name: Run ci-doctor (SARIF for code scanning)
+      id: sarif
+      shell: bash
+      run: |
+        set +e
+        npx --yes ci-doctor@${{ inputs.ci-doctor-version }} ${{ steps.flags.outputs.flags }} --sarif "${{ inputs.path }}" > ci-doctor.sarif
+        echo "sarif-path=ci-doctor.sarif" >> "$GITHUB_OUTPUT"
+
+    - name: Run ci-doctor (JSON for finding-count output)
+      id: json
+      shell: bash
+      run: |
+        set +e
+        npx --yes ci-doctor@${{ inputs.ci-doctor-version }} ${{ steps.flags.outputs.flags }} --json "${{ inputs.path }}" > ci-doctor.json
+        if [ -s ci-doctor.json ]; then
+          COUNT=$(node -e "try{const j=JSON.parse(require('fs').readFileSync('ci-doctor.json','utf8'));console.log(Array.isArray(j.findings)?j.findings.length:(j.summary&&j.summary.total||0))}catch(e){console.log(0)}")
+        else
+          COUNT=0
+        fi
+        echo "finding-count=$COUNT" >> "$GITHUB_OUTPUT"
+        echo "Findings: $COUNT"
+
+    - name: Upload SARIF to GitHub Code Scanning
+      if: ${{ inputs.upload-sarif == 'true' && hashFiles('ci-doctor.sarif') != '' }}
+      uses: github/codeql-action/upload-sarif@1b1aada464948af03b950897e5eb522f92603cc2 # v3.27.0
+      with:
+        sarif_file: ci-doctor.sarif
+        category: ci-doctor
+      continue-on-error: true
+
+    - name: Comment on pull request
+      if: ${{ inputs.comment-on-pr == 'true' && github.event_name == 'pull_request' && hashFiles('ci-doctor.md') != '' }}
+      uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+      with:
+        script: |
+          const fs = require('fs');
+          let body = '';
+          try { body = fs.readFileSync('ci-doctor.md', 'utf8'); } catch { return; }
+          body = body.trim();
+          if (!body) return;
+          if (body.length > 60000) body = body.slice(0, 60000) + '\n\n_truncated_';
+          const marker = '<!-- ci-doctor-bot -->';
+          const header = `${marker}\n\n## ci-doctor findings\n\n`;
+          const full = header + body + '\n\n---\n_Powered by [ci-doctor](https://www.npmjs.com/package/ci-doctor) — [docs](https://depmedicdev-byte.github.io/)_';
+          const { data: comments } = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+            per_page: 100,
+          });
+          const existing = comments.find((c) => c.body && c.body.includes(marker));
+          if (existing) {
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: existing.id,
+              body: full,
+            });
+          } else {
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: full,
+            });
+          }
+      continue-on-error: true
+
+    - name: Enforce severity threshold
+      shell: bash
+      run: |
+        npx --yes ci-doctor@${{ inputs.ci-doctor-version }} ${{ steps.flags.outputs.flags }} --severity=${{ inputs.fail-on }} "${{ inputs.path }}"

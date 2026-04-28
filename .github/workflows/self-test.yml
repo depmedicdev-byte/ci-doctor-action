@@ -1,0 +1,20 @@
+name: self-test
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+  pull-requests: write
+  security-events: write
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Run self
+        uses: ./
+        with:
+          fail-on: error
+          upload-sarif: 'false'
+          comment-on-pr: 'false'
